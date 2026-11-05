@@ -138,31 +138,70 @@ const fmt = d => new Date(d).toLocaleDateString('es', {day:'numeric', month:'lon
 const j = async u => { const r = await fetch(u); if(!r.ok) throw 0; return r.json(); };
 const rss2json = u => j('https://api.rss2json.com/v1/api.json?rss_url=' + encodeURIComponent(u));
 
+let diag=[];
+const txt=(n,t)=>{const e=n.getElementsByTagName(t)[0];return e?e.textContent:''};
+const xml=async u=>{const r=await fetch(u);if(!r.ok)throw new Error('HTTP '+r.status);return new DOMParser().parseFromString(await r.text(),'text/xml')};
+const proxies=[u=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u),u=>'https://corsproxy.io/?'+encodeURIComponent(u)];
+async function viaProxy(u){let e;for(const p of proxies){try{return await xml(p(u))}catch(x){e=x}}throw e}
+const imgOf=h=>{const m=(h||'').match(/<img[^>]+src=["']([^"']+)/i);return m?m[1]:''};
+
 async function loadBlog(){
-  const u = `https://${CONFIG.blogHost}/feeds/posts/default?alt=json&max-results=25`;
-  const d = await j(u);
-  return (d.feed.entry||[]).map(e => {
-    const html = (e.content && e.content.$t) || (e.summary && e.summary.$t) || '';
-    const m = html.match(/<img[^>]+src=["']([^"']+)/i);
-    const link = (e.link||[]).find(l => l.rel === 'alternate');
-    return {type:'blog', title:e.title.$t, url:link ? link.href : '#', date:e.published.$t, img:m ? m[1] : '', text:strip(html).slice(0,160)};
-  });
+  const base=`https://${CONFIG.blogHost}/feeds/posts/default`;
+  try{
+    const d=await j(base+'?alt=json&max-results=25');
+    return (d.feed.entry||[]).map(e=>{
+      const html=(e.content&&e.content.$t)||(e.summary&&e.summary.$t)||'';
+      const l=(e.link||[]).find(l=>l.rel==='alternate');
+      return {type:'blog',title:e.title.$t,url:l?l.href:'#',date:e.published.$t,img:imgOf(html),text:strip(html).slice(0,160)};
+    });
+  }catch(e1){
+    const doc=await viaProxy(base+'?alt=rss&max-results=25');
+    return [...doc.querySelectorAll('item')].map(n=>{
+      const html=txt(n,'description');
+      return {type:'blog',title:txt(n,'title'),url:txt(n,'link'),date:txt(n,'pubDate'),img:imgOf(html),text:strip(html).slice(0,160)};
+    });
+  }
 }
 async function loadYT(){
-  const q = CONFIG.ytChannelId ? 'channel_id=' + CONFIG.ytChannelId : 'user=' + CONFIG.ytUser;
-  const d = await rss2json('https://www.youtube.com/feeds/videos.xml?' + q);
-  return (d.items||[]).map(v => ({type:'video', title:v.title, url:v.link, date:v.pubDate.replace(' ','T') + 'Z', img:v.thumbnail || (v.enclosure && v.enclosure.link) || '', text:strip(v.description).slice(0,160)}));
+  const id0=CONFIG.ytChannelId;
+  const ids=id0?[id0,id0.replace(/^(.{6})O/,'$10')]:[null];
+  let err;
+  for(const id of [...new Set(ids)]){
+    const u='https://www.youtube.com/feeds/videos.xml?'+(id?'channel_id='+id:'user='+CONFIG.ytUser);
+    try{
+      const d=await rss2json(u);
+      if(d.items&&d.items.length)return d.items.map(v=>({type:'video',title:v.title,url:v.link,date:v.pubDate.replace(' ','T')+'Z',img:v.thumbnail||(v.enclosure&&v.enclosure.link)||'',text:strip(v.description).slice(0,160)}));
+    }catch(e){err=e}
+    try{
+      const doc=await viaProxy(u);
+      const out=[...doc.getElementsByTagName('entry')].map(n=>{
+        const l=[...n.getElementsByTagName('link')].find(x=>x.getAttribute('rel')==='alternate');
+        const th=n.getElementsByTagName('media:thumbnail')[0];
+        return {type:'video',title:txt(n,'title'),url:l?l.getAttribute('href'):'#',date:txt(n,'published'),img:th?th.getAttribute('url'):'',text:strip(txt(n,'media:description')).slice(0,160)};
+      });
+      if(out.length)return out;
+    }catch(e){err=e}
+  }
+  throw err||new Error('0 vídeos');
 }
 
 async function load(){
   $('#ref').classList.add('spin');
-  const [b, y] = await Promise.allSettled([loadBlog(), loadYT()]);
-  const got = [...(b.value||[]), ...(y.value||[])];
-  if(got.length){ items = got.sort((a,z) => new Date(z.date) - new Date(a.date)); demo = false; }
-  else if(!items.length){ items = sample(); demo = true; }
+  const [b,y]=await Promise.allSettled([loadBlog(),loadYT()]);
+  diag=[];
+  const chk=(n,r)=>{if(r.status==='rejected')diag.push(n+': no se pudo leer el feed ('+((r.reason&&r.reason.message)||'error')+')');else if(!r.value.length)diag.push(n+': el feed no tiene publicaciones')};
+  chk('Blog',b);chk('YouTube',y);
+  const got=[...(b.value||[]),...(y.value||[])];
+  if(got.length){items=got.sort((a,z)=>new Date(z.date)-new Date(a.date));demo=false}
+  else if(!items.length){items=sample();demo=true}
   $('#ref').classList.remove('spin');
   render();
 }
+
+const note=()=>{
+  if(!demo&&!diag.length)return '';
+  return '<div class="note">'+(demo?'Vista previa del diseño con contenido de ejemplo.':'Algunas publicaciones no se pudieron cargar.')+(diag.length?'<br><small>'+diag.map(esc).join('<br>')+'</small>':'')+'</div>';
+};
 
 function sample(){
   const t = Date.now(), D = n => new Date(t - n*864e5).toISOString();
@@ -181,7 +220,7 @@ function render(){
   const [h, ...rest] = list;
   const tag = i => i.type === 'video' ? '<span class="tag v">▶ VÍDEO</span>' : '<span class="tag">✦ BLOG</span>';
   v.innerHTML =
-    (demo ? '<div class="note">Vista previa del diseño con contenido de ejemplo. Al abrir la app desde tu propio alojamiento, se cargarán tus publicaciones reales.</div>' : '') +
+    note() +
     `<a class="hero" href="${esc(h.url)}" target="_blank" rel="noopener">
        <i class="shine"></i><div class="img" style="${h.img ? `background-image:url('${esc(h.img)}')` : ''}"></div>
        ${h.type === 'video' ? '<div class="play">▶</div>' : ''}
